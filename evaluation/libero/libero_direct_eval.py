@@ -31,8 +31,23 @@ def _print_help_without_runtime_deps() -> None:
     parser.add_argument(
         "--adapter_mode",
         default="single",
-        choices=["single", "fuse"],
-        help="Adapter routing mode. 'fuse' uses one adapter first, then switches to another.",
+        choices=["single", "fuse", "suite"],
+        help="Adapter routing mode. 'suite' chooses adapter folder from task suite.",
+    )
+    parser.add_argument(
+        "--suite_lora_root",
+        default=None,
+        help="HF repo id or local root containing goal/object/long/spatial adapter folders.",
+    )
+    parser.add_argument(
+        "--suite_lora_map",
+        default=None,
+        help="Optional suite=folder overrides, e.g. libero_10=long,libero_goal=goal.",
+    )
+    parser.add_argument(
+        "--suite_lora_checkpoint_subdir",
+        default=None,
+        help="Optional checkpoint subfolder appended inside each suite folder.",
     )
     parser.add_argument(
         "--fuse_first_lora_path",
@@ -143,6 +158,12 @@ LIBERO_DATASETS_HORIZON = {
 }
 
 DEFAULT_TASK_SUITES = ["libero_10", "libero_spatial", "libero_goal", "libero_object"]
+DEFAULT_SUITE_ADAPTER_FOLDERS = {
+    "libero_goal": "goal",
+    "libero_object": "object",
+    "libero_10": "long",
+    "libero_spatial": "spatial",
+}
 benchmark_dict = benchmark.get_benchmark_dict()
 
 
@@ -241,6 +262,37 @@ def parse_task_ids(value: Optional[str]) -> Optional[List[int]]:
     return deduped
 
 
+def parse_suite_adapter_map(value: Optional[str]) -> Dict[str, str]:
+    mapping = dict(DEFAULT_SUITE_ADAPTER_FOLDERS)
+    if value is None or not value.strip():
+        return mapping
+
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                "Suite adapter map entries must look like suite=folder, "
+                f"got: {item}"
+            )
+        suite, folder = item.split("=", 1)
+        suite = suite.strip()
+        folder = folder.strip().strip("/")
+        if suite not in LIBERO_DATASETS:
+            raise ValueError(f"Unknown LIBERO suite in adapter map: {suite}")
+        if not folder:
+            raise ValueError(f"Empty adapter folder for suite: {suite}")
+        mapping[suite] = folder
+    return mapping
+
+
+def append_checkpoint_subdir(folder: str, checkpoint_subdir: Optional[str]) -> str:
+    if checkpoint_subdir is None or not checkpoint_subdir.strip():
+        return folder.strip("/")
+    return f"{folder.strip('/')}/{checkpoint_subdir.strip().strip('/')}"
+
+
 class LiberoAbsActionProcessor:
     """Helpers to convert between 6D rotation and axis-angle."""
 
@@ -285,6 +337,9 @@ class DirectXVLAAgent:
         processor_path: Optional[str] = None,
         lora_path: Optional[str] = None,
         adapter_mode: str = "single",
+        suite_lora_root: Optional[str] = None,
+        suite_lora_map: Optional[str] = None,
+        suite_lora_checkpoint_subdir: Optional[str] = None,
         fuse_first_lora_path: Optional[str] = None,
         fuse_rest_lora_path: Optional[str] = None,
         fuse_switch_step: int = 20,
@@ -300,6 +355,10 @@ class DirectXVLAAgent:
         self.processor_utils = LiberoAbsActionProcessor()
         self.adapter_mode = adapter_mode
         self.fuse_switch_step = fuse_switch_step
+        self.suite_lora_root = suite_lora_root
+        self.suite_lora_map = parse_suite_adapter_map(suite_lora_map)
+        self.suite_lora_checkpoint_subdir = suite_lora_checkpoint_subdir
+        self.loaded_adapter_names: set[str] = set()
         self.active_adapter_name: Optional[str] = None
 
         processor_path = processor_path or model_path
@@ -329,8 +388,10 @@ class DirectXVLAAgent:
                 adapter_name="fuse_first",
                 torch_dtype=self.torch_dtype,
             )
+            self.loaded_adapter_names.add("fuse_first")
             print(f"Loading fuse rest adapter from: {fuse_rest_lora_path}")
             self.model.load_adapter(fuse_rest_lora_path, adapter_name="fuse_rest")
+            self.loaded_adapter_names.add("fuse_rest")
             self.active_adapter_name = "fuse_first"
         elif lora_path:
             print(f"Applying LoRA weights from: {lora_path}")
@@ -342,7 +403,11 @@ class DirectXVLAAgent:
                 adapter_name="single",
                 torch_dtype=self.torch_dtype,
             )
+            self.loaded_adapter_names.add("single")
             self.active_adapter_name = "single"
+        elif adapter_mode == "suite":
+            if not suite_lora_root:
+                raise ValueError("suite mode requires --suite_lora_root")
         elif adapter_mode != "single":
             raise ValueError(f"Unsupported adapter_mode: {adapter_mode}")
 
@@ -360,11 +425,15 @@ class DirectXVLAAgent:
     def _initial_adapter_name(self) -> Optional[str]:
         if self.adapter_mode == "fuse":
             return "fuse_first"
+        if self.adapter_mode == "suite":
+            return self.active_adapter_name
         return "single" if self.active_adapter_name == "single" else None
 
     def _adapter_name_for_step(self, env_step: int) -> Optional[str]:
         if self.adapter_mode == "fuse":
             return "fuse_first" if env_step < self.fuse_switch_step else "fuse_rest"
+        if self.adapter_mode == "suite":
+            return self.active_adapter_name
         return "single" if self.active_adapter_name == "single" else None
 
     def _set_active_adapter(self, adapter_name: Optional[str]) -> None:
@@ -383,6 +452,55 @@ class DirectXVLAAgent:
         if adapter_name != self.active_adapter_name:
             self.action_plan.clear()
             self._set_active_adapter(adapter_name)
+
+    def _adapter_source_for_suite(self, suite_name: str) -> tuple[str, Dict[str, str]]:
+        if suite_name not in self.suite_lora_map:
+            raise ValueError(
+                f"No suite adapter folder is configured for {suite_name}. "
+                "Use concrete suites like libero_goal/libero_object/libero_10/libero_spatial, "
+                "or pass --suite_lora_map."
+            )
+
+        folder = append_checkpoint_subdir(
+            self.suite_lora_map[suite_name],
+            self.suite_lora_checkpoint_subdir,
+        )
+        root_path = Path(self.suite_lora_root).expanduser() if self.suite_lora_root else None
+        if root_path is not None and root_path.exists():
+            adapter_path = root_path / Path(folder)
+            if not adapter_path.exists():
+                raise FileNotFoundError(f"Suite adapter folder does not exist: {adapter_path}")
+            return str(adapter_path), {}
+        return str(self.suite_lora_root), {"subfolder": folder}
+
+    def set_suite_adapter(self, suite_name: str) -> None:
+        if self.adapter_mode != "suite":
+            return
+
+        adapter_name = f"suite_{suite_name}"
+        if adapter_name not in self.loaded_adapter_names:
+            source, kwargs = self._adapter_source_for_suite(suite_name)
+            print(f"Loading adapter for {suite_name}: source={source}, options={kwargs}")
+            if not self.loaded_adapter_names:
+                from peft import PeftModel
+
+                self.model = PeftModel.from_pretrained(
+                    self.model,
+                    source,
+                    adapter_name=adapter_name,
+                    torch_dtype=self.torch_dtype,
+                    **kwargs,
+                )
+                self.model = self.model.to(self.device).to(self.torch_dtype)
+                self.model.eval()
+            else:
+                if not hasattr(self.model, "load_adapter"):
+                    raise RuntimeError("Suite adapter mode requires a PEFT model with load_adapter().")
+                self.model.load_adapter(source, adapter_name=adapter_name, **kwargs)
+            self.loaded_adapter_names.add(adapter_name)
+
+        self.action_plan.clear()
+        self._set_active_adapter(adapter_name)
 
     def reset(self, seed: Optional[int] = None) -> None:
         if seed is not None:
@@ -617,6 +735,7 @@ def eval_libero_direct(
     _ensure_dir(save_path)
 
     for suite_name in task_suites:
+        agent.set_suite_adapter(suite_name)
         horizon = max_steps if max_steps is not None else LIBERO_DATASETS_HORIZON[suite_name]
         evaluator = DirectLIBEROEval(
             task_suite_name=suite_name,
@@ -648,8 +767,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--adapter_mode",
         default="single",
-        choices=["single", "fuse"],
-        help="Adapter routing mode. 'fuse' uses one adapter first, then switches to another.",
+        choices=["single", "fuse", "suite"],
+        help="Adapter routing mode. 'suite' chooses adapter folder from task suite.",
+    )
+    parser.add_argument(
+        "--suite_lora_root",
+        default=None,
+        help="HF repo id or local root containing goal/object/long/spatial adapter folders.",
+    )
+    parser.add_argument(
+        "--suite_lora_map",
+        default=None,
+        help="Optional suite=folder overrides, e.g. libero_10=long,libero_goal=goal.",
+    )
+    parser.add_argument(
+        "--suite_lora_checkpoint_subdir",
+        default=None,
+        help="Optional checkpoint subfolder appended inside each suite folder.",
     )
     parser.add_argument(
         "--fuse_first_lora_path",
@@ -732,6 +866,19 @@ def main() -> int:
             parser.error("fuse mode requires --fuse_first_lora_path or --lora_path")
         if not args.fuse_rest_lora_path:
             parser.error("fuse mode requires --fuse_rest_lora_path")
+    if args.adapter_mode == "suite":
+        if not args.suite_lora_root:
+            parser.error("suite mode requires --suite_lora_root")
+        try:
+            suite_lora_map = parse_suite_adapter_map(args.suite_lora_map)
+        except ValueError as exc:
+            parser.error(str(exc))
+        missing_suites = [suite for suite in task_suites if suite not in suite_lora_map]
+        if missing_suites:
+            parser.error(
+                "suite mode has no adapter folder for: "
+                f"{missing_suites}. Pass --suite_lora_map to add them."
+            )
 
     env_seed = args.env_seed if args.env_seed is not None else args.init_seed
     policy_seed = args.policy_seed if args.policy_seed is not None else args.init_seed
@@ -744,6 +891,9 @@ def main() -> int:
     print(f"processor_path: {args.processor_path or args.model_path}")
     print(f"lora_path: {args.lora_path}")
     print(f"adapter_mode: {args.adapter_mode}")
+    print(f"suite_lora_root: {args.suite_lora_root}")
+    print(f"suite_lora_map: {args.suite_lora_map or DEFAULT_SUITE_ADAPTER_FOLDERS}")
+    print(f"suite_lora_checkpoint_subdir: {args.suite_lora_checkpoint_subdir}")
     print(f"fuse_first_lora_path: {args.fuse_first_lora_path or args.lora_path}")
     print(f"fuse_rest_lora_path: {args.fuse_rest_lora_path}")
     print(f"fuse_switch_step: {args.fuse_switch_step}")
@@ -767,6 +917,9 @@ def main() -> int:
             processor_path=args.processor_path,
             lora_path=args.lora_path,
             adapter_mode=args.adapter_mode,
+            suite_lora_root=args.suite_lora_root,
+            suite_lora_map=args.suite_lora_map,
+            suite_lora_checkpoint_subdir=args.suite_lora_checkpoint_subdir,
             fuse_first_lora_path=args.fuse_first_lora_path,
             fuse_rest_lora_path=args.fuse_rest_lora_path,
             fuse_switch_step=args.fuse_switch_step,
