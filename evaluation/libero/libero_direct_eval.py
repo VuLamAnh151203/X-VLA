@@ -12,6 +12,7 @@ import argparse
 import collections
 import json
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -39,7 +40,19 @@ def _print_help_without_runtime_deps() -> None:
         help="Task ids to evaluate, e.g. 0,1,4-7. Defaults to all tasks.",
     )
     parser.add_argument("--eval_time", type=int, default=10, help="Episodes per selected task")
-    parser.add_argument("--init_seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--init_seed", type=int, default=42, help="Fallback seed for env and policy")
+    parser.add_argument(
+        "--env_seed",
+        type=int,
+        default=None,
+        help="LIBERO environment seed; defaults to --init_seed.",
+    )
+    parser.add_argument(
+        "--policy_seed",
+        type=int,
+        default=None,
+        help="Python/NumPy/Torch/CUDA policy seed; defaults to --init_seed.",
+    )
     parser.add_argument("--device", default="cuda", help="Device: cuda, cuda:0, cpu, or auto")
     parser.add_argument(
         "--dtype",
@@ -138,6 +151,18 @@ def torch_dtype_from_name(name: str) -> torch.dtype:
         "bfloat16": torch.bfloat16,
     }
     return dtype_map[name]
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def rollout_seed(base_seed: int, task_id: int, ep: int) -> int:
+    return base_seed + task_id * 10000 + ep
 
 
 def parse_task_suites(values: Optional[Sequence[str]]) -> List[str]:
@@ -280,7 +305,9 @@ class DirectXVLAAgent:
             raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is False.")
         return torch.device(device)
 
-    def reset(self) -> None:
+    def reset(self, seed: Optional[int] = None) -> None:
+        if seed is not None:
+            seed_everything(seed)
         self.proprio: Optional[np.ndarray] = None
         self.action_plan: Deque[List[float]] = collections.deque()
 
@@ -356,7 +383,8 @@ class DirectLIBEROEval:
         eval_horizon: int = 600,
         act_type: str = "abs",
         num_episodes: int = 10,
-        init_seed: int = 42,
+        env_seed: int = 42,
+        policy_seed: int = 42,
         no_video: bool = False,
     ) -> None:
         self.task_suite_name = task_suite_name
@@ -365,7 +393,8 @@ class DirectLIBEROEval:
         self.task_ids = list(task_ids) if task_ids is not None else None
         self.eval_horizon = eval_horizon
         self.num_episodes = num_episodes
-        self.init_seed = init_seed
+        self.env_seed = env_seed
+        self.policy_seed = policy_seed
         self.act_type = act_type
         self.no_video = no_video
         self.processor = LiberoAbsActionProcessor()
@@ -409,7 +438,7 @@ class DirectLIBEROEval:
         }
         env = OffScreenRenderEnv(**env_args)
 
-        env.seed(self.init_seed + ep + 100)
+        env.seed(rollout_seed(self.env_seed, task_id, ep) + 100)
         obs = env.reset()
         init_states = task_suite.get_task_init_states(task_id)
         init_state_id = ep % init_states.shape[0]
@@ -440,6 +469,7 @@ class DirectLIBEROEval:
 
     def _rollout(self, task_suite, policy: DirectXVLAAgent, task_id: int, ep: int) -> float:
         env, lang, obs = self._init_env(task_suite, task_id, ep)
+        seed_everything(rollout_seed(self.policy_seed, task_id, ep))
         images: List[np.ndarray] = []
 
         done_flag = False
@@ -482,7 +512,7 @@ class DirectLIBEROEval:
             selected_ids = self._selected_task_ids(task_suite)
             for task_id in tqdm(selected_ids, desc="Evaluating tasks"):
                 for ep in range(self.num_episodes):
-                    policy.reset()
+                    policy.reset(seed=rollout_seed(self.policy_seed, task_id, ep))
                     rewards.append(self._rollout(task_suite, policy, task_id, ep))
 
         eval_rewards = float(sum(rewards) / max(len(rewards), 1))
@@ -496,7 +526,8 @@ def eval_libero_direct(
     task_suites: Iterable[str],
     task_ids: Optional[Sequence[int]] = None,
     num_episodes: int = 10,
-    init_seed: int = 42,
+    env_seed: int = 42,
+    policy_seed: int = 42,
     act_type: str = "abs",
     no_video: bool = False,
     max_steps: Optional[int] = None,
@@ -512,7 +543,8 @@ def eval_libero_direct(
             eval_horizon=horizon,
             act_type=act_type,
             num_episodes=num_episodes,
-            init_seed=init_seed,
+            env_seed=env_seed,
+            policy_seed=policy_seed,
             no_video=no_video,
         )
         result_dict[suite_name] = evaluator.eval_episodes(agent, save_path=save_path)
@@ -544,7 +576,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Task ids to evaluate, e.g. 0,1,4-7. Defaults to all tasks.",
     )
     parser.add_argument("--eval_time", type=int, default=10, help="Episodes per selected task")
-    parser.add_argument("--init_seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--init_seed", type=int, default=42, help="Fallback seed for env and policy")
+    parser.add_argument(
+        "--env_seed",
+        type=int,
+        default=None,
+        help="LIBERO environment seed; defaults to --init_seed.",
+    )
+    parser.add_argument(
+        "--policy_seed",
+        type=int,
+        default=None,
+        help="Python/NumPy/Torch/CUDA policy seed; defaults to --init_seed.",
+    )
     parser.add_argument("--device", default="cuda", help="Device: cuda, cuda:0, cpu, or auto")
     parser.add_argument(
         "--dtype",
@@ -579,6 +623,9 @@ def main() -> int:
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error("--max_steps must be greater than 0")
 
+    env_seed = args.env_seed if args.env_seed is not None else args.init_seed
+    policy_seed = args.policy_seed if args.policy_seed is not None else args.init_seed
+
     output_dir = Path(args.output_dir)
     _ensure_dir(output_dir)
 
@@ -589,6 +636,8 @@ def main() -> int:
     print(f"task_suites: {task_suites}")
     print(f"task_ids: {task_ids if task_ids is not None else 'all'}")
     print(f"episodes per task: {args.eval_time}")
+    print(f"env_seed: {env_seed}")
+    print(f"policy_seed: {policy_seed}")
     print(f"device: {args.device}")
     print(f"dtype: {args.dtype}")
     print(f"steps: {args.steps}")
@@ -614,7 +663,8 @@ def main() -> int:
             task_suites=task_suites,
             task_ids=task_ids,
             num_episodes=args.eval_time,
-            init_seed=args.init_seed,
+            env_seed=env_seed,
+            policy_seed=policy_seed,
             act_type=args.act_type,
             no_video=args.no_video,
             max_steps=args.max_steps,
