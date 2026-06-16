@@ -48,6 +48,12 @@ def _print_help_without_runtime_deps() -> None:
         help="Model dtype",
     )
     parser.add_argument("--steps", type=int, default=10, help="Denoising steps")
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Optional rollout step limit; defaults to the LIBERO suite horizon.",
+    )
     parser.add_argument("--domain_id", type=int, default=3, help="XVLA domain id for LIBERO")
     parser.add_argument("--act_type", default="abs", choices=["abs", "rel"], help="LIBERO action type")
     parser.add_argument("--output_dir", default="logs_direct/", help="Directory for logs and videos")
@@ -493,12 +499,13 @@ def eval_libero_direct(
     init_seed: int = 42,
     act_type: str = "abs",
     no_video: bool = False,
+    max_steps: Optional[int] = None,
 ) -> Dict[str, float]:
     result_dict: Dict[str, float] = {}
     _ensure_dir(save_path)
 
     for suite_name in task_suites:
-        horizon = LIBERO_DATASETS_HORIZON[suite_name]
+        horizon = max_steps if max_steps is not None else LIBERO_DATASETS_HORIZON[suite_name]
         evaluator = DirectLIBEROEval(
             task_suite_name=suite_name,
             task_ids=task_ids,
@@ -546,6 +553,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model dtype",
     )
     parser.add_argument("--steps", type=int, default=10, help="Denoising steps")
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Optional rollout step limit; defaults to the LIBERO suite horizon.",
+    )
     parser.add_argument("--domain_id", type=int, default=3, help="XVLA domain id for LIBERO")
     parser.add_argument("--act_type", default="abs", choices=["abs", "rel"], help="LIBERO action type")
     parser.add_argument("--output_dir", default="logs_direct/", help="Directory for logs and videos")
@@ -563,6 +576,9 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
+    if args.max_steps is not None and args.max_steps <= 0:
+        parser.error("--max_steps must be greater than 0")
+
     output_dir = Path(args.output_dir)
     _ensure_dir(output_dir)
 
@@ -576,6 +592,7 @@ def main() -> int:
     print(f"device: {args.device}")
     print(f"dtype: {args.dtype}")
     print(f"steps: {args.steps}")
+    print(f"max_steps: {args.max_steps if args.max_steps is not None else 'suite default'}")
     print(f"domain_id: {args.domain_id}")
     print(f"act_type: {args.act_type}")
     print(f"output_dir: {output_dir.resolve()}")
@@ -600,6 +617,7 @@ def main() -> int:
             init_seed=args.init_seed,
             act_type=args.act_type,
             no_video=args.no_video,
+            max_steps=args.max_steps,
         )
     except KeyboardInterrupt:
         print("Interrupted by user.")
