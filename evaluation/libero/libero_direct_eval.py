@@ -29,6 +29,28 @@ def _print_help_without_runtime_deps() -> None:
     )
     parser.add_argument("--lora_path", default=None, help="Optional LoRA adapter path")
     parser.add_argument(
+        "--adapter_mode",
+        default="single",
+        choices=["single", "fuse"],
+        help="Adapter routing mode. 'fuse' uses one adapter first, then switches to another.",
+    )
+    parser.add_argument(
+        "--fuse_first_lora_path",
+        default=None,
+        help="First adapter for fuse mode; defaults to --lora_path.",
+    )
+    parser.add_argument(
+        "--fuse_rest_lora_path",
+        default=None,
+        help="Adapter used after --fuse_switch_step in fuse mode.",
+    )
+    parser.add_argument(
+        "--fuse_switch_step",
+        type=int,
+        default=20,
+        help="LIBERO env step where fuse mode switches to the rest adapter.",
+    )
+    parser.add_argument(
         "--task_suites",
         nargs="+",
         default=["libero_10", "libero_spatial", "libero_goal", "libero_object"],
@@ -262,6 +284,10 @@ class DirectXVLAAgent:
         model_path: str,
         processor_path: Optional[str] = None,
         lora_path: Optional[str] = None,
+        adapter_mode: str = "single",
+        fuse_first_lora_path: Optional[str] = None,
+        fuse_rest_lora_path: Optional[str] = None,
+        fuse_switch_step: int = 20,
         device: str = "cuda",
         dtype: str = "float32",
         steps: int = 10,
@@ -272,6 +298,9 @@ class DirectXVLAAgent:
         self.steps = steps
         self.domain_id = domain_id
         self.processor_utils = LiberoAbsActionProcessor()
+        self.adapter_mode = adapter_mode
+        self.fuse_switch_step = fuse_switch_step
+        self.active_adapter_name: Optional[str] = None
 
         processor_path = processor_path or model_path
         print(f"Loading XVLAProcessor from: {processor_path}")
@@ -284,15 +313,38 @@ class DirectXVLAAgent:
             torch_dtype=self.torch_dtype,
         )
 
-        if lora_path:
+        if adapter_mode == "fuse":
+            first_path = fuse_first_lora_path or lora_path
+            if not first_path:
+                raise ValueError("fuse mode requires --fuse_first_lora_path or --lora_path")
+            if not fuse_rest_lora_path:
+                raise ValueError("fuse mode requires --fuse_rest_lora_path")
+
+            print(f"Loading fuse first adapter from: {first_path}")
+            from peft import PeftModel
+
+            self.model = PeftModel.from_pretrained(
+                self.model,
+                first_path,
+                adapter_name="fuse_first",
+                torch_dtype=self.torch_dtype,
+            )
+            print(f"Loading fuse rest adapter from: {fuse_rest_lora_path}")
+            self.model.load_adapter(fuse_rest_lora_path, adapter_name="fuse_rest")
+            self.active_adapter_name = "fuse_first"
+        elif lora_path:
             print(f"Applying LoRA weights from: {lora_path}")
             from peft import PeftModel
 
             self.model = PeftModel.from_pretrained(
                 self.model,
                 lora_path,
+                adapter_name="single",
                 torch_dtype=self.torch_dtype,
             )
+            self.active_adapter_name = "single"
+        elif adapter_mode != "single":
+            raise ValueError(f"Unsupported adapter_mode: {adapter_mode}")
 
         self.model = self.model.to(self.device).to(self.torch_dtype)
         self.model.eval()
@@ -305,11 +357,39 @@ class DirectXVLAAgent:
             raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is False.")
         return torch.device(device)
 
+    def _initial_adapter_name(self) -> Optional[str]:
+        if self.adapter_mode == "fuse":
+            return "fuse_first"
+        return "single" if self.active_adapter_name == "single" else None
+
+    def _adapter_name_for_step(self, env_step: int) -> Optional[str]:
+        if self.adapter_mode == "fuse":
+            return "fuse_first" if env_step < self.fuse_switch_step else "fuse_rest"
+        return "single" if self.active_adapter_name == "single" else None
+
+    def _set_active_adapter(self, adapter_name: Optional[str]) -> None:
+        if adapter_name is None:
+            return
+        if self.active_adapter_name == adapter_name:
+            return
+        if not hasattr(self.model, "set_adapter"):
+            raise RuntimeError("Adapter switching requested, but model does not support set_adapter().")
+        print(f"Switching active adapter to: {adapter_name}")
+        self.model.set_adapter(adapter_name)
+        self.active_adapter_name = adapter_name
+
+    def _prepare_adapter_for_step(self, env_step: int) -> None:
+        adapter_name = self._adapter_name_for_step(env_step)
+        if adapter_name != self.active_adapter_name:
+            self.action_plan.clear()
+            self._set_active_adapter(adapter_name)
+
     def reset(self, seed: Optional[int] = None) -> None:
         if seed is not None:
             seed_everything(seed)
         self.proprio: Optional[np.ndarray] = None
         self.action_plan: Deque[List[float]] = collections.deque()
+        self._set_active_adapter(self._initial_adapter_name())
 
     def _to_model(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.is_floating_point():
@@ -355,7 +435,8 @@ class DirectXVLAAgent:
             raise RuntimeError(f"Unexpected action shape from model: {action.shape}")
         return action
 
-    def step(self, obs: Dict, goal: str) -> np.ndarray:
+    def step(self, obs: Dict, goal: str, env_step: int = 0) -> np.ndarray:
+        self._prepare_adapter_for_step(env_step)
         if not self.action_plan:
             action = self._infer_action_plan(obs, goal)
 
@@ -474,13 +555,13 @@ class DirectLIBEROEval:
 
         done_flag = False
         try:
-            for _ in tqdm(range(self.eval_horizon), desc=f"{lang}"):
+            for step_idx in tqdm(range(self.eval_horizon), desc=f"{lang}"):
                 robo_ori = self.processor.Mat_to_Rotate6D(env.env.robots[0].controller.ee_ori_mat)
                 robo_pos = env.env.robots[0].controller.ee_pos
                 obs["robo_ori"] = robo_ori
                 obs["robo_pos"] = robo_pos
 
-                action = policy.step(obs, lang)
+                action = policy.step(obs, lang, env_step=step_idx)
 
                 if not self.no_video:
                     images.append(_flip_agentview(obs["agentview_image"]))
@@ -565,6 +646,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--lora_path", default=None, help="Optional LoRA adapter path")
     parser.add_argument(
+        "--adapter_mode",
+        default="single",
+        choices=["single", "fuse"],
+        help="Adapter routing mode. 'fuse' uses one adapter first, then switches to another.",
+    )
+    parser.add_argument(
+        "--fuse_first_lora_path",
+        default=None,
+        help="First adapter for fuse mode; defaults to --lora_path.",
+    )
+    parser.add_argument(
+        "--fuse_rest_lora_path",
+        default=None,
+        help="Adapter used after --fuse_switch_step in fuse mode.",
+    )
+    parser.add_argument(
+        "--fuse_switch_step",
+        type=int,
+        default=20,
+        help="LIBERO env step where fuse mode switches to the rest adapter.",
+    )
+    parser.add_argument(
         "--task_suites",
         nargs="+",
         default=DEFAULT_TASK_SUITES,
@@ -622,6 +725,13 @@ def main() -> int:
 
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error("--max_steps must be greater than 0")
+    if args.fuse_switch_step <= 0:
+        parser.error("--fuse_switch_step must be greater than 0")
+    if args.adapter_mode == "fuse":
+        if not (args.fuse_first_lora_path or args.lora_path):
+            parser.error("fuse mode requires --fuse_first_lora_path or --lora_path")
+        if not args.fuse_rest_lora_path:
+            parser.error("fuse mode requires --fuse_rest_lora_path")
 
     env_seed = args.env_seed if args.env_seed is not None else args.init_seed
     policy_seed = args.policy_seed if args.policy_seed is not None else args.init_seed
@@ -633,6 +743,10 @@ def main() -> int:
     print(f"model_path: {args.model_path}")
     print(f"processor_path: {args.processor_path or args.model_path}")
     print(f"lora_path: {args.lora_path}")
+    print(f"adapter_mode: {args.adapter_mode}")
+    print(f"fuse_first_lora_path: {args.fuse_first_lora_path or args.lora_path}")
+    print(f"fuse_rest_lora_path: {args.fuse_rest_lora_path}")
+    print(f"fuse_switch_step: {args.fuse_switch_step}")
     print(f"task_suites: {task_suites}")
     print(f"task_ids: {task_ids if task_ids is not None else 'all'}")
     print(f"episodes per task: {args.eval_time}")
@@ -652,6 +766,10 @@ def main() -> int:
             model_path=args.model_path,
             processor_path=args.processor_path,
             lora_path=args.lora_path,
+            adapter_mode=args.adapter_mode,
+            fuse_first_lora_path=args.fuse_first_lora_path,
+            fuse_rest_lora_path=args.fuse_rest_lora_path,
+            fuse_switch_step=args.fuse_switch_step,
             device=args.device,
             dtype=args.dtype,
             steps=args.steps,
